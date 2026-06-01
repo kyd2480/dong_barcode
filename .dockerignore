@@ -1,0 +1,9 @@
+node_modules
+npm-debug.log
+.env
+data
+incoming
+videos
+videos-index.json
+_local_data
+_sample.mp4
