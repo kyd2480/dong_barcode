@@ -15,7 +15,6 @@ const storageRoot = path.resolve(
 const videoDir = path.join(storageRoot, "videos");
 const incomingDir = path.join(storageRoot, "incoming");
 const indexPath = path.join(storageRoot, "videos-index.json");
-const uploadToken = process.env.CCTV_UPLOAD_TOKEN || "";
 const corsOrigin = process.env.CORS_ORIGIN || "*";
 
 app.use(cors({ origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((item) => item.trim()) }));
@@ -71,11 +70,6 @@ function isDirectBrowserVideo(item) {
   return item.extension === ".mp4" && process.env.CCTV_DIRECT_MP4 === "1";
 }
 
-function requireUploadToken(req, res, next) {
-  if (!uploadToken) return next();
-  if (req.get("X-Upload-Token") === uploadToken) return next();
-  return res.status(401).json({ error: "invalid upload token" });
-}
 
 async function findVideo(id) {
   const items = await readIndex();
@@ -90,7 +84,7 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, storageRoot, videoDir });
 });
 
-app.post("/api/videos/upload", requireUploadToken, upload.single("video"), async (req, res, next) => {
+app.post("/api/videos/upload", upload.single("video"), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: "video file is required" });
 
@@ -225,3 +219,4 @@ const server = process.env.CCTV_NO_LISTEN === "1"
     });
 
 export { app, server, storageRoot, videoDir };
+
