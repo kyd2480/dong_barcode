@@ -16,6 +16,8 @@ const videoDir = path.join(storageRoot, "videos");
 const incomingDir = path.join(storageRoot, "incoming");
 const indexPath = path.join(storageRoot, "videos-index.json");
 const corsOrigin = process.env.CORS_ORIGIN || "*";
+const retentionDays = Math.max(1, Number(process.env.CCTV_RETENTION_DAYS || 60));
+const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
 
 app.use(cors({ origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((item) => item.trim()) }));
 app.use(express.json({ limit: "1mb" }));
@@ -70,6 +72,58 @@ function isDirectBrowserVideo(item) {
   return item.extension === ".mp4" && process.env.CCTV_DIRECT_MP4 === "1";
 }
 
+function isExpiredUploadedAt(value, now = Date.now()) {
+  const time = new Date(value || 0).getTime();
+  return Number.isFinite(time) && time > 0 && now - time > retentionMs;
+}
+
+async function cleanupExpiredVideos() {
+  const now = Date.now();
+  const items = await readIndex();
+  const keep = [];
+  const knownStoredNames = new Set();
+  let deleted = 0;
+
+  for (const item of items) {
+    knownStoredNames.add(item.storedName);
+    if (!isExpiredUploadedAt(item.uploadedAt, now)) {
+      keep.push(item);
+      continue;
+    }
+
+    const absolutePath = path.resolve(videoDir, item.storedName);
+    if (absolutePath.startsWith(videoDir)) {
+      try {
+        await fsp.unlink(absolutePath);
+        deleted += 1;
+      } catch (error) {
+        if (error.code !== "ENOENT") console.error(`Failed to delete expired video ${item.storedName}:`, error);
+      }
+    }
+  }
+
+  let looseDeleted = 0;
+  try {
+    const files = await fsp.readdir(videoDir);
+    for (const fileName of files) {
+      if (knownStoredNames.has(fileName)) continue;
+      const absolutePath = path.join(videoDir, fileName);
+      const stat = await fsp.stat(absolutePath);
+      if (!stat.isFile() || now - stat.mtimeMs <= retentionMs) continue;
+      await fsp.unlink(absolutePath);
+      looseDeleted += 1;
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") console.error("Failed to scan loose video files:", error);
+  }
+
+  if (keep.length !== items.length) await writeIndex(keep);
+  if (deleted || looseDeleted) {
+    console.log(`Expired CCTV cleanup: indexDeleted=${deleted}, looseDeleted=${looseDeleted}, retentionDays=${retentionDays}`);
+  }
+  return { deleted, looseDeleted, retentionDays };
+}
+
 
 async function findVideo(id) {
   const items = await readIndex();
@@ -81,11 +135,12 @@ async function findVideo(id) {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, storageRoot, videoDir });
+  res.json({ ok: true, storageRoot, videoDir, retentionDays });
 });
 
 app.post("/api/videos/upload", upload.single("video"), async (req, res, next) => {
   try {
+    cleanupExpiredVideos().catch((error) => console.error("Expired CCTV cleanup failed:", error));
     if (!req.file) return res.status(400).json({ error: "video file is required" });
 
     const originalName = req.file.originalname || "recording";
@@ -124,6 +179,7 @@ app.post("/api/videos/upload", upload.single("video"), async (req, res, next) =>
 
 app.get("/api/videos", async (req, res, next) => {
   try {
+    await cleanupExpiredVideos();
     const query = compact(req.query.invoice || req.query.q || "");
     const items = await readIndex();
     const filtered = query
@@ -211,6 +267,11 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: error.message || "server error" });
 });
 
+cleanupExpiredVideos().catch((error) => console.error("Expired CCTV cleanup failed:", error));
+setInterval(() => {
+  cleanupExpiredVideos().catch((error) => console.error("Expired CCTV cleanup failed:", error));
+}, 6 * 60 * 60 * 1000).unref();
+
 const server = process.env.CCTV_NO_LISTEN === "1"
   ? null
   : app.listen(port, () => {
@@ -219,4 +280,5 @@ const server = process.env.CCTV_NO_LISTEN === "1"
     });
 
 export { app, server, storageRoot, videoDir };
+
 

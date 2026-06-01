@@ -35,9 +35,12 @@ PORT=3000
 CORS_ORIGIN=*
 CCTV_MAX_UPLOAD_BYTES=1073741824
 CCTV_DIRECT_MP4=0
+CCTV_RETENTION_DAYS=60
 ```
 
 업로드 토큰은 사용하지 않습니다. 내부용 서버 기준으로 누구나 업로드 가능하게 열어둔 구성입니다.
+
+보관 기간은 기본 60일입니다. 서버는 시작 시, 업로드 시, 조회 시, 그리고 6시간마다 60일이 지난 인덱스 영상과 인덱스에 없는 오래된 파일을 삭제합니다. `CCTV_RETENTION_DAYS` 값으로 기간을 바꿀 수 있습니다.
 
 ## API
 
