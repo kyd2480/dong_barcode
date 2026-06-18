@@ -16,7 +16,7 @@ const videoDir = path.join(storageRoot, "videos");
 const incomingDir = path.join(storageRoot, "incoming");
 const indexPath = path.join(storageRoot, "videos-index.json");
 const corsOrigin = process.env.CORS_ORIGIN || "*";
-const retentionDays = Math.max(1, Number(process.env.CCTV_RETENTION_DAYS || 60));
+const retentionDays = Math.max(1, Number(process.env.CCTV_RETENTION_DAYS || 30));
 const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
 
 app.use(cors({ origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((item) => item.trim()) }));
@@ -280,5 +280,6 @@ const server = process.env.CCTV_NO_LISTEN === "1"
     });
 
 export { app, server, storageRoot, videoDir };
+
 
 
