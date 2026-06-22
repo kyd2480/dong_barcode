@@ -15,19 +15,27 @@ const storageRoot = path.resolve(
 const videoDir = path.join(storageRoot, "videos");
 const incomingDir = path.join(storageRoot, "incoming");
 const indexPath = path.join(storageRoot, "videos-index.json");
+const desktopAppUpdateDir = path.join(storageRoot, "desktop-app");
+const desktopAppUpdateManifestPath = path.join(desktopAppUpdateDir, "latest.json");
 const corsOrigin = process.env.CORS_ORIGIN || "*";
 const retentionDays = Math.max(1, Number(process.env.CCTV_RETENTION_DAYS || 30));
 const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
 
+app.set("trust proxy", true);
 app.use(cors({ origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((item) => item.trim()) }));
 app.use(express.json({ limit: "1mb" }));
 
 await fsp.mkdir(videoDir, { recursive: true });
 await fsp.mkdir(incomingDir, { recursive: true });
+await fsp.mkdir(desktopAppUpdateDir, { recursive: true });
 
 const upload = multer({
   dest: incomingDir,
   limits: { fileSize: Number(process.env.CCTV_MAX_UPLOAD_BYTES || 1024 * 1024 * 1024) },
+});
+const desktopAppUpload = multer({
+  dest: incomingDir,
+  limits: { fileSize: Number(process.env.DESKTOP_APP_MAX_UPLOAD_BYTES || 200 * 1024 * 1024) },
 });
 
 function sanitizePart(value, fallback = "unknown") {
@@ -56,6 +64,26 @@ async function writeIndex(items) {
   const tempPath = `${indexPath}.${Date.now()}.tmp`;
   await fsp.writeFile(tempPath, JSON.stringify(items, null, 2), "utf8");
   await fsp.rename(tempPath, indexPath);
+}
+
+async function readDesktopAppManifest() {
+  try {
+    return JSON.parse(await fsp.readFile(desktopAppUpdateManifestPath, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function getRequestBaseUrl(req) {
+  const protocol = req.protocol || "https";
+  return `${protocol}://${req.get("host")}`;
+}
+
+function getBearerToken(req) {
+  const header = String(req.get("authorization") || "");
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : "";
 }
 
 function getMimeType(fileName) {
@@ -136,6 +164,85 @@ async function findVideo(id) {
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, storageRoot, videoDir, retentionDays });
+});
+
+app.get("/api/desktop-app/latest", async (req, res, next) => {
+  try {
+    const manifest = await readDesktopAppManifest();
+    if (!manifest?.version || !manifest?.fileName) {
+      return res.status(404).json({ error: "desktop app update is not configured" });
+    }
+
+    const appPath = path.resolve(desktopAppUpdateDir, manifest.fileName);
+    if (!appPath.startsWith(desktopAppUpdateDir)) {
+      return res.status(400).json({ error: "invalid update manifest" });
+    }
+
+    try {
+      await fsp.access(appPath, fs.constants.R_OK);
+    } catch {
+      return res.status(404).json({ error: "desktop app update file not found" });
+    }
+
+    res.json({
+      version: manifest.version,
+      fileName: manifest.fileName,
+      sha256: manifest.sha256 || "",
+      mandatory: manifest.mandatory !== false,
+      downloadUrl: `${getRequestBaseUrl(req)}/api/desktop-app/download`,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/desktop-app/download", async (_req, res, next) => {
+  try {
+    const manifest = await readDesktopAppManifest();
+    if (!manifest?.fileName) {
+      return res.status(404).json({ error: "desktop app update is not configured" });
+    }
+
+    const appPath = path.resolve(desktopAppUpdateDir, manifest.fileName);
+    if (!appPath.startsWith(desktopAppUpdateDir)) {
+      return res.status(400).json({ error: "invalid update manifest" });
+    }
+
+    res.download(appPath, manifest.fileName);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/desktop-app/upload", desktopAppUpload.single("app"), async (req, res, next) => {
+  try {
+    const token = process.env.DESKTOP_UPDATE_TOKEN || "";
+    if (!token) return res.status(503).json({ error: "desktop update upload is disabled" });
+    if (getBearerToken(req) !== token) return res.status(401).json({ error: "unauthorized" });
+    if (!req.file) return res.status(400).json({ error: "app file is required" });
+
+    const version = String(req.body.version || "").trim();
+    if (!version) return res.status(400).json({ error: "version is required" });
+
+    await fsp.mkdir(desktopAppUpdateDir, { recursive: true });
+    const fileName = "BarcodeWebcamRecorder.exe";
+    const targetPath = path.join(desktopAppUpdateDir, fileName);
+    await fsp.rename(req.file.path, targetPath);
+
+    const fileBuffer = await fsp.readFile(targetPath);
+    const manifest = {
+      version,
+      fileName,
+      sha256: crypto.createHash("sha256").update(fileBuffer).digest("hex"),
+      mandatory: true,
+      uploadedAt: new Date().toISOString(),
+    };
+    await fsp.writeFile(desktopAppUpdateManifestPath, JSON.stringify(manifest, null, 2), "utf8");
+    res.status(201).json(manifest);
+  } catch (error) {
+    if (req.file?.path) fsp.unlink(req.file.path).catch(() => {});
+    next(error);
+  }
 });
 
 app.post("/api/videos/upload", upload.single("video"), async (req, res, next) => {

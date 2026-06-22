@@ -36,6 +36,7 @@ CORS_ORIGIN=*
 CCTV_MAX_UPLOAD_BYTES=1073741824
 CCTV_DIRECT_MP4=0
 CCTV_RETENTION_DAYS=30
+DESKTOP_UPDATE_TOKEN=change-me
 ```
 
 업로드 토큰은 사용하지 않습니다. 내부용 서버 기준으로 누구나 업로드 가능하게 열어둔 구성입니다.
@@ -51,4 +52,10 @@ CCTV_RETENTION_DAYS=30
 - `GET /api/videos?invoice=송장번호`
 - `GET /api/videos/:id/stream`
 - `GET /api/videos/:id/download`
+- `GET /api/desktop-app/latest`
+- `GET /api/desktop-app/download`
+- `POST /api/desktop-app/upload`
+  - header: `Authorization: Bearer DESKTOP_UPDATE_TOKEN`
+  - multipart field: `app`
+  - form field: `version`
 
