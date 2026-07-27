@@ -20,9 +20,6 @@ const desktopAppUpdateManifestPath = path.join(desktopAppUpdateDir, "latest.json
 const corsOrigin = process.env.CORS_ORIGIN || "*";
 const retentionDays = Math.max(1, Number(process.env.CCTV_RETENTION_DAYS || 30));
 const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
-const maxConcurrentVideoUploads = Math.max(1, Number(process.env.CCTV_MAX_CONCURRENT_UPLOADS || 1));
-const uploadRetryAfterSeconds = Math.max(1, Number(process.env.CCTV_UPLOAD_RETRY_AFTER_SECONDS || 60));
-let activeVideoUploads = 0;
 
 app.set("trust proxy", true);
 app.use(cors({ origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((item) => item.trim()) }));
@@ -108,30 +105,6 @@ function isExpiredUploadedAt(value, now = Date.now()) {
   return Number.isFinite(time) && time > 0 && now - time > retentionMs;
 }
 
-function limitConcurrentVideoUploads(req, res, next) {
-  if (activeVideoUploads >= maxConcurrentVideoUploads) {
-    res.setHeader("Retry-After", String(uploadRetryAfterSeconds));
-    return res.status(429).json({
-      error: "too many video uploads",
-      activeUploads: activeVideoUploads,
-      maxConcurrentUploads: maxConcurrentVideoUploads,
-      retryAfterSeconds: uploadRetryAfterSeconds,
-    });
-  }
-
-  activeVideoUploads += 1;
-  let released = false;
-  const release = () => {
-    if (released) return;
-    released = true;
-    activeVideoUploads = Math.max(0, activeVideoUploads - 1);
-  };
-
-  res.once("finish", release);
-  res.once("close", release);
-  next();
-}
-
 async function cleanupExpiredVideos() {
   const now = Date.now();
   const items = await readIndex();
@@ -190,14 +163,7 @@ async function findVideo(id) {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    storageRoot,
-    videoDir,
-    retentionDays,
-    activeVideoUploads,
-    maxConcurrentVideoUploads,
-  });
+  res.json({ ok: true, storageRoot, videoDir, retentionDays });
 });
 
 app.get("/api/desktop-app/latest", async (req, res, next) => {
@@ -279,7 +245,7 @@ app.post("/api/desktop-app/upload", desktopAppUpload.single("app"), async (req, 
   }
 });
 
-app.post("/api/videos/upload", limitConcurrentVideoUploads, upload.single("video"), async (req, res, next) => {
+app.post("/api/videos/upload", upload.single("video"), async (req, res, next) => {
   try {
     cleanupExpiredVideos().catch((error) => console.error("Expired CCTV cleanup failed:", error));
     if (!req.file) return res.status(400).json({ error: "video file is required" });
@@ -421,5 +387,6 @@ const server = process.env.CCTV_NO_LISTEN === "1"
     });
 
 export { app, server, storageRoot, videoDir };
+
 
 
