@@ -214,44 +214,9 @@ async function getFirebaseReadUrl(item, disposition = "inline") {
   return url;
 }
 
-async function streamFirebaseVideo(item, req, res) {
-  const bucket = await getFirebaseBucket();
-  const file = bucket.file(item.storagePath);
-  const [metadata] = await file.getMetadata();
-  const size = Number(metadata.size || item.size || 0);
-  const contentType = metadata.contentType || item.mimeType || getMimeType(item.fileName || item.originalName || "video.mp4");
-  const range = req.headers.range;
-
-  res.setHeader("Accept-Ranges", "bytes");
-  res.setHeader("Content-Type", contentType);
-  res.setHeader("Cache-Control", "private, max-age=300");
-
-  if (range && size > 0) {
-    const match = range.match(/bytes=(\d+)-(\d*)/);
-    if (!match) return res.status(416).end();
-    const start = Number(match[1]);
-    const end = match[2] ? Number(match[2]) : size - 1;
-    if (start >= size || end >= size || start > end) return res.status(416).end();
-    res.status(206);
-    res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
-    res.setHeader("Content-Length", end - start + 1);
-    const stream = file.createReadStream({ start, end });
-    stream.on("error", (error) => {
-      console.error(`Firebase stream failed ${item.storagePath}:`, error);
-      if (!res.headersSent) res.status(500).json({ error: error.message || "Firebase stream failed" });
-      else res.destroy(error);
-    });
-    return stream.pipe(res);
-  }
-
-  if (size > 0) res.setHeader("Content-Length", size);
-  const stream = file.createReadStream();
-  stream.on("error", (error) => {
-    console.error(`Firebase stream failed ${item.storagePath}:`, error);
-    if (!res.headersSent) res.status(500).json({ error: error.message || "Firebase stream failed" });
-    else res.destroy(error);
-  });
-  return stream.pipe(res);
+async function streamFirebaseVideo(item, req, res, next) {
+  const url = await getFirebaseReadUrl(item, "inline");
+  return transcodeVideoToBrowserMp4(url, req, res, next);
 }
 
 function isExpiredUploadedAt(value, now = Date.now()) {
@@ -302,6 +267,51 @@ function acquireVideoTranscode(res) {
     released = true;
     activeVideoTranscodes = Math.max(0, activeVideoTranscodes - 1);
   };
+}
+
+function transcodeVideoToBrowserMp4(input, req, res, next) {
+  const releaseTranscode = acquireVideoTranscode(res);
+  if (!releaseTranscode) return;
+
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Cache-Control", "no-store");
+  const ffmpeg = spawn("ffmpeg", [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    input,
+    "-map",
+    "0:v:0",
+    "-an",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-tune",
+    "zerolatency",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "frag_keyframe+empty_moov+default_base_moof",
+    "-f",
+    "mp4",
+    "pipe:1",
+  ]);
+
+  ffmpeg.stdout.pipe(res);
+  ffmpeg.stderr.on("data", (chunk) => console.error(String(chunk)));
+  ffmpeg.on("error", (error) => {
+    releaseTranscode();
+    if (!res.headersSent) next(error);
+    else res.destroy(error);
+  });
+  ffmpeg.on("close", releaseTranscode);
+  res.once("finish", releaseTranscode);
+  res.once("close", () => {
+    releaseTranscode();
+    if (!ffmpeg.killed) ffmpeg.kill("SIGKILL");
+  });
 }
 
 async function cleanupExpiredVideos() {
@@ -630,7 +640,7 @@ app.get("/api/videos/:id/stream", async (req, res, next) => {
     const found = await findVideo(req.params.id);
     if (!found) return res.status(404).json({ error: "video not found" });
     if (found.firebase) {
-      return streamFirebaseVideo(found.item, req, res);
+      return streamFirebaseVideo(found.item, req, res, next);
     }
     const { item, absolutePath } = found;
 
