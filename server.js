@@ -20,12 +20,15 @@ const desktopAppUpdateManifestPath = path.join(desktopAppUpdateDir, "latest.json
 const corsOrigin = process.env.CORS_ORIGIN || "*";
 const retentionDays = Math.max(1, Number(process.env.CCTV_RETENTION_DAYS || 30));
 const retentionMs = retentionDays * 24 * 60 * 60 * 1000;
+const firebaseStorageBucket = process.env.FIREBASE_STORAGE_BUCKET || "dongtantest4.firebasestorage.app";
+const firebaseSignedUrlMinutes = Math.max(1, Number(process.env.FIREBASE_SIGNED_URL_MINUTES || 30));
 const maxConcurrentVideoUploads = Math.max(1, Number(process.env.CCTV_MAX_CONCURRENT_UPLOADS || 1));
 const uploadRetryAfterSeconds = Math.max(1, Number(process.env.CCTV_UPLOAD_RETRY_AFTER_SECONDS || 60));
 const maxConcurrentVideoTranscodes = Math.max(1, Number(process.env.CCTV_MAX_CONCURRENT_TRANSCODES || 1));
 const transcodeRetryAfterSeconds = Math.max(1, Number(process.env.CCTV_TRANSCODE_RETRY_AFTER_SECONDS || 30));
 let activeVideoUploads = 0;
 let activeVideoTranscodes = 0;
+let firebaseBucketPromise = null;
 
 app.set("trust proxy", true);
 app.use(cors({ origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((item) => item.trim()) }));
@@ -106,6 +109,182 @@ function isDirectBrowserVideo(item) {
   return item.extension === ".mp4" && process.env.CCTV_DIRECT_MP4 === "1";
 }
 
+function isFirebaseStorageItem(item) {
+  return Boolean(item?.storageProvider === "firebase" && item?.storagePath);
+}
+
+function normalizeBranchKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function videoDatabaseBranchOf(item) {
+  return normalizeBranchKey(item?.databaseBranch || item?.branch || "");
+}
+
+function sortVideosForStoragePriority(items, storageFirst) {
+  if (!storageFirst) return items;
+  return [...items].sort((a, b) => {
+    const storageDelta = Number(isFirebaseStorageItem(b)) - Number(isFirebaseStorageItem(a));
+    if (storageDelta) return storageDelta;
+    return new Date(b.uploadedAt || 0).getTime() - new Date(a.uploadedAt || 0).getTime();
+  });
+}
+
+function hasFirebaseServiceAccountConfig() {
+  return Boolean(
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON ||
+      process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 ||
+      process.env.FIREBASE_SERVICE_ACCOUNT_PATH
+  );
+}
+
+function parseFirebaseServiceAccount() {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  }
+
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
+    return JSON.parse(Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf8"));
+  }
+
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
+    return JSON.parse(fs.readFileSync(process.env.FIREBASE_SERVICE_ACCOUNT_PATH, "utf8"));
+  }
+
+  return null;
+}
+
+async function getFirebaseBucket() {
+  if (firebaseBucketPromise) return firebaseBucketPromise;
+
+  firebaseBucketPromise = (async () => {
+    if (!firebaseStorageBucket) {
+      throw new Error("FIREBASE_STORAGE_BUCKET is not configured");
+    }
+
+    const serviceAccount = parseFirebaseServiceAccount();
+    if (!serviceAccount) {
+      throw new Error(
+        "Firebase service account is not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_SERVICE_ACCOUNT_BASE64, or FIREBASE_SERVICE_ACCOUNT_PATH."
+      );
+    }
+
+    const [{ getApps, initializeApp, cert }, { getStorage }] = await Promise.all([
+      import("firebase-admin/app"),
+      import("firebase-admin/storage"),
+    ]);
+
+    const appName = "cctv-storage";
+    const app =
+      getApps().find((candidate) => candidate.name === appName) ||
+      initializeApp(
+        {
+          credential: cert(serviceAccount),
+          storageBucket: firebaseStorageBucket,
+        },
+        appName
+      );
+
+    return getStorage(app).bucket(firebaseStorageBucket);
+  })();
+
+  return firebaseBucketPromise;
+}
+
+function buildFirebaseStoragePath(invoiceNumber, fileName, now = new Date()) {
+  const year = String(now.getUTCFullYear());
+  const month = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(now.getUTCDate()).padStart(2, "0");
+  const extension = path.extname(fileName || "").toLowerCase() || ".mp4";
+  const safeInvoice = sanitizePart(invoiceNumber, "UNKNOWN");
+  const safeFileName = sanitizePart(path.basename(fileName || `recording${extension}`), `recording${extension}`);
+  return `videos/${year}/${month}/${day}/${safeInvoice}_${Date.now()}_${crypto.randomUUID()}_${safeFileName}`;
+}
+
+async function getFirebaseReadUrl(item, disposition = "inline") {
+  const bucket = await getFirebaseBucket();
+  const file = bucket.file(item.storagePath);
+  const expires = Date.now() + firebaseSignedUrlMinutes * 60 * 1000;
+  const [url] = await file.getSignedUrl({
+    action: "read",
+    expires,
+    responseDisposition: `${disposition}; filename="${encodeURIComponent(item.fileName || item.originalName || "video.mp4")}"`,
+    responseType: item.mimeType || getMimeType(item.fileName || item.originalName || "video.mp4"),
+  });
+  return url;
+}
+
+function firebaseVideoId(storagePath) {
+  return `firebase:${Buffer.from(storagePath).toString("base64url")}`;
+}
+
+function storagePathFromFirebaseVideoId(id) {
+  if (!String(id || "").startsWith("firebase:")) return "";
+  try {
+    return Buffer.from(String(id).slice("firebase:".length), "base64url").toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+function firebaseItemFromFile(file, metadata = {}) {
+  const storagePath = file.name;
+  const fileName = path.basename(storagePath);
+  const extension = path.extname(fileName).toLowerCase() || ".mp4";
+  const invoiceNumber = sanitizePart(fileName.split("_")[0] || path.basename(fileName, extension), "UNKNOWN");
+  return {
+    id: firebaseVideoId(storagePath),
+    invoiceNumber,
+    originalName: fileName,
+    storedName: fileName,
+    fileName,
+    extension,
+    mimeType: metadata.contentType || getMimeType(fileName),
+    size: Number(metadata.size || 0),
+    uploadedAt: metadata.updated || metadata.timeCreated || new Date().toISOString(),
+    storageProvider: "firebase",
+    storageBucket: firebaseStorageBucket,
+    storagePath,
+  };
+}
+
+function recentFirebaseVideoPrefixes(now = new Date()) {
+  const prefixes = [];
+  const maxDays = Math.min(retentionDays, Number(process.env.CCTV_FIREBASE_SEARCH_DAYS || 31));
+  for (let offset = 0; offset < maxDays; offset += 1) {
+    const date = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
+    const year = String(date.getUTCFullYear());
+    const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(date.getUTCDate()).padStart(2, "0");
+    prefixes.push(`videos/${year}/${month}/${day}/`);
+  }
+  return prefixes;
+}
+
+async function searchFirebaseVideosByInvoice(query, knownStoragePaths = new Set()) {
+  if (!query || !hasFirebaseServiceAccountConfig()) return [];
+  const bucket = await getFirebaseBucket();
+  const maxResults = Math.max(1, Number(process.env.CCTV_FIREBASE_SEARCH_MAX_RESULTS || 100));
+  const matches = [];
+
+  for (const prefix of recentFirebaseVideoPrefixes()) {
+    const [files] = await bucket.getFiles({
+      prefix,
+      autoPaginate: false,
+      maxResults: Math.max(maxResults, 100),
+    });
+    for (const file of files) {
+      if (matches.length >= maxResults) return matches;
+      if (knownStoragePaths.has(file.name)) continue;
+      if (!compact(path.basename(file.name)).includes(query)) continue;
+      const [metadata] = await file.getMetadata();
+      matches.push(firebaseItemFromFile(file, metadata));
+    }
+  }
+
+  return matches;
+}
+
 function isExpiredUploadedAt(value, now = Date.now()) {
   const time = new Date(value || 0).getTime();
   return Number.isFinite(time) && time > 0 && now - time > retentionMs;
@@ -164,9 +343,20 @@ async function cleanupExpiredVideos() {
   let deleted = 0;
 
   for (const item of items) {
-    knownStoredNames.add(item.storedName);
+    if (item.storedName) knownStoredNames.add(item.storedName);
     if (!isExpiredUploadedAt(item.uploadedAt, now)) {
       keep.push(item);
+      continue;
+    }
+
+    if (isFirebaseStorageItem(item)) {
+      try {
+        const bucket = await getFirebaseBucket();
+        await bucket.file(item.storagePath).delete({ ignoreNotFound: true });
+        deleted += 1;
+      } catch (error) {
+        console.error(`Failed to delete expired Firebase video ${item.storagePath}:`, error);
+      }
       continue;
     }
 
@@ -207,7 +397,17 @@ async function cleanupExpiredVideos() {
 async function findVideo(id) {
   const items = await readIndex();
   const item = items.find((entry) => entry.id === id);
+  const fallbackStoragePath = storagePathFromFirebaseVideoId(id);
+  if (!item && fallbackStoragePath) {
+    const bucket = await getFirebaseBucket();
+    const file = bucket.file(fallbackStoragePath);
+    const [exists] = await file.exists();
+    if (!exists) return null;
+    const [metadata] = await file.getMetadata();
+    return { item: firebaseItemFromFile(file, metadata), firebase: true };
+  }
   if (!item) return null;
+  if (isFirebaseStorageItem(item)) return { item, firebase: true };
   const absolutePath = path.resolve(videoDir, item.storedName);
   if (!absolutePath.startsWith(videoDir)) return null;
   return { item, absolutePath };
@@ -225,6 +425,8 @@ app.get("/health", (_req, res) => {
     activeVideoTranscodes,
     maxConcurrentVideoTranscodes,
     memoryUsage,
+    firebaseStorageBucket,
+    firebaseConfigured: hasFirebaseServiceAccountConfig(),
   });
 });
 
@@ -334,6 +536,7 @@ app.post("/api/videos/upload", limitConcurrentVideoUploads, upload.single("video
       mimeType: getMimeType(storedName),
       size: stat.size,
       uploadedAt: new Date().toISOString(),
+      databaseBranch: normalizeBranchKey(req.body.databaseBranch),
     };
     const items = await readIndex();
     items.unshift(item);
@@ -346,14 +549,108 @@ app.post("/api/videos/upload", limitConcurrentVideoUploads, upload.single("video
   }
 });
 
+app.post("/api/videos/firebase-upload-url", async (req, res, next) => {
+  try {
+    if (!hasFirebaseServiceAccountConfig()) {
+      return res.status(503).json({ error: "Firebase Storage upload is not configured" });
+    }
+
+    const originalName = String(req.body.fileName || req.body.originalName || "recording.mp4").trim();
+    const extension = path.extname(originalName).toLowerCase() || ".mp4";
+    const invoiceNumber = sanitizePart(req.body.invoiceNumber || path.basename(originalName, extension), "UNKNOWN");
+    const mimeType = String(req.body.mimeType || getMimeType(originalName)).trim() || "application/octet-stream";
+    const storagePath = buildFirebaseStoragePath(invoiceNumber, originalName);
+    const bucket = await getFirebaseBucket();
+    const file = bucket.file(storagePath);
+    const expires = Date.now() + firebaseSignedUrlMinutes * 60 * 1000;
+    const [uploadUrl] = await file.getSignedUrl({
+      action: "write",
+      expires,
+      contentType: mimeType,
+    });
+
+    res.json({
+      uploadUrl,
+      storagePath,
+      bucket: firebaseStorageBucket,
+      method: "PUT",
+      expiresAt: new Date(expires).toISOString(),
+      headers: {
+        "Content-Type": mimeType,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/videos/firebase-complete", async (req, res, next) => {
+  try {
+    if (!hasFirebaseServiceAccountConfig()) {
+      return res.status(503).json({ error: "Firebase Storage upload is not configured" });
+    }
+
+    cleanupExpiredVideos().catch((error) => console.error("Expired CCTV cleanup failed:", error));
+
+    const storagePath = String(req.body.storagePath || "").trim();
+    if (!storagePath) return res.status(400).json({ error: "storagePath is required" });
+
+    const bucket = await getFirebaseBucket();
+    const file = bucket.file(storagePath);
+    const [exists] = await file.exists();
+    if (!exists) return res.status(404).json({ error: "uploaded Firebase file not found" });
+
+    const [metadata] = await file.getMetadata();
+    const originalName = String(req.body.originalName || req.body.fileName || path.basename(storagePath)).trim();
+    const extension = path.extname(originalName).toLowerCase() || path.extname(storagePath).toLowerCase() || ".mp4";
+    const invoiceNumber = sanitizePart(req.body.invoiceNumber || path.basename(originalName, extension), "UNKNOWN");
+    const id = crypto.randomUUID();
+    const item = {
+      id,
+      invoiceNumber,
+      originalName,
+      storedName: path.basename(storagePath),
+      fileName: path.basename(storagePath),
+      extension,
+      mimeType: String(req.body.mimeType || metadata.contentType || getMimeType(originalName)),
+      size: Number(metadata.size || req.body.size || 0),
+      uploadedAt: new Date().toISOString(),
+      storageProvider: "firebase",
+      storageBucket: firebaseStorageBucket,
+      storagePath,
+      databaseBranch: normalizeBranchKey(req.body.databaseBranch),
+    };
+
+    const items = await readIndex();
+    items.unshift(item);
+    await writeIndex(items);
+
+    res.status(201).json(item);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/videos", async (req, res, next) => {
   try {
     const query = compact(req.query.invoice || req.query.q || "");
+    const databaseBranch = normalizeBranchKey(req.query.databaseBranch);
+    const storageFirst = req.query.storageFirst === "1" || req.query.storageFirst === "true";
     const items = await readIndex();
-    const filtered = query
-      ? items.filter((item) => compact(item.invoiceNumber).includes(query) || compact(item.fileName).includes(query))
+    const branchFiltered = databaseBranch
+      ? items.filter((item) => {
+          const itemBranch = videoDatabaseBranchOf(item);
+          return !itemBranch || itemBranch === databaseBranch;
+        })
       : items.slice(0, 100);
-    res.json({ items: filtered.slice(0, 100) });
+    const filtered = query
+      ? branchFiltered.filter((item) => compact(item.invoiceNumber).includes(query) || compact(item.fileName).includes(query))
+      : branchFiltered;
+    const knownStoragePaths = new Set(items.filter(isFirebaseStorageItem).map((item) => item.storagePath));
+    const firebaseFallbackItems = storageFirst && query
+      ? await searchFirebaseVideosByInvoice(query, knownStoragePaths)
+      : [];
+    res.json({ items: sortVideosForStoragePriority([...filtered, ...firebaseFallbackItems], storageFirst).slice(0, 100) });
   } catch (error) {
     next(error);
   }
@@ -363,6 +660,9 @@ app.get("/api/videos/:id/download", async (req, res, next) => {
   try {
     const found = await findVideo(req.params.id);
     if (!found) return res.status(404).json({ error: "video not found" });
+    if (found.firebase) {
+      return res.redirect(await getFirebaseReadUrl(found.item, "attachment"));
+    }
     res.download(found.absolutePath, found.item.fileName);
   } catch (error) {
     next(error);
@@ -373,6 +673,9 @@ app.get("/api/videos/:id/stream", async (req, res, next) => {
   try {
     const found = await findVideo(req.params.id);
     if (!found) return res.status(404).json({ error: "video not found" });
+    if (found.firebase) {
+      return res.redirect(await getFirebaseReadUrl(found.item, "inline"));
+    }
     const { item, absolutePath } = found;
 
     if (isDirectBrowserVideo(item) && req.query.transcode !== "1") {
