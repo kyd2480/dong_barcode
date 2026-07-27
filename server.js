@@ -235,11 +235,23 @@ async function streamFirebaseVideo(item, req, res) {
     res.status(206);
     res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
     res.setHeader("Content-Length", end - start + 1);
-    return file.createReadStream({ start, end }).pipe(res);
+    const stream = file.createReadStream({ start, end });
+    stream.on("error", (error) => {
+      console.error(`Firebase stream failed ${item.storagePath}:`, error);
+      if (!res.headersSent) res.status(500).json({ error: error.message || "Firebase stream failed" });
+      else res.destroy(error);
+    });
+    return stream.pipe(res);
   }
 
   if (size > 0) res.setHeader("Content-Length", size);
-  return file.createReadStream().pipe(res);
+  const stream = file.createReadStream();
+  stream.on("error", (error) => {
+    console.error(`Firebase stream failed ${item.storagePath}:`, error);
+    if (!res.headersSent) res.status(500).json({ error: error.message || "Firebase stream failed" });
+    else res.destroy(error);
+  });
+  return stream.pipe(res);
 }
 
 function isExpiredUploadedAt(value, now = Date.now()) {
