@@ -214,75 +214,32 @@ async function getFirebaseReadUrl(item, disposition = "inline") {
   return url;
 }
 
-function firebaseVideoId(storagePath) {
-  return `firebase:${Buffer.from(storagePath).toString("base64url")}`;
-}
-
-function storagePathFromFirebaseVideoId(id) {
-  if (!String(id || "").startsWith("firebase:")) return "";
-  try {
-    return Buffer.from(String(id).slice("firebase:".length), "base64url").toString("utf8");
-  } catch {
-    return "";
-  }
-}
-
-function firebaseItemFromFile(file, metadata = {}) {
-  const storagePath = file.name;
-  const fileName = path.basename(storagePath);
-  const extension = path.extname(fileName).toLowerCase() || ".mp4";
-  const invoiceNumber = sanitizePart(fileName.split("_")[0] || path.basename(fileName, extension), "UNKNOWN");
-  return {
-    id: firebaseVideoId(storagePath),
-    invoiceNumber,
-    originalName: fileName,
-    storedName: fileName,
-    fileName,
-    extension,
-    mimeType: metadata.contentType || getMimeType(fileName),
-    size: Number(metadata.size || 0),
-    uploadedAt: metadata.updated || metadata.timeCreated || new Date().toISOString(),
-    storageProvider: "firebase",
-    storageBucket: firebaseStorageBucket,
-    storagePath,
-  };
-}
-
-function recentFirebaseVideoPrefixes(now = new Date()) {
-  const prefixes = [];
-  const maxDays = Math.min(retentionDays, Number(process.env.CCTV_FIREBASE_SEARCH_DAYS || 31));
-  for (let offset = 0; offset < maxDays; offset += 1) {
-    const date = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
-    const year = String(date.getUTCFullYear());
-    const month = String(date.getUTCMonth() + 1).padStart(2, "0");
-    const day = String(date.getUTCDate()).padStart(2, "0");
-    prefixes.push(`videos/${year}/${month}/${day}/`);
-  }
-  return prefixes;
-}
-
-async function searchFirebaseVideosByInvoice(query, knownStoragePaths = new Set()) {
-  if (!query || !hasFirebaseServiceAccountConfig()) return [];
+async function streamFirebaseVideo(item, req, res) {
   const bucket = await getFirebaseBucket();
-  const maxResults = Math.max(1, Number(process.env.CCTV_FIREBASE_SEARCH_MAX_RESULTS || 100));
-  const matches = [];
+  const file = bucket.file(item.storagePath);
+  const [metadata] = await file.getMetadata();
+  const size = Number(metadata.size || item.size || 0);
+  const contentType = metadata.contentType || item.mimeType || getMimeType(item.fileName || item.originalName || "video.mp4");
+  const range = req.headers.range;
 
-  for (const prefix of recentFirebaseVideoPrefixes()) {
-    const [files] = await bucket.getFiles({
-      prefix,
-      autoPaginate: false,
-      maxResults: Math.max(maxResults, 100),
-    });
-    for (const file of files) {
-      if (matches.length >= maxResults) return matches;
-      if (knownStoragePaths.has(file.name)) continue;
-      if (!compact(path.basename(file.name)).includes(query)) continue;
-      const [metadata] = await file.getMetadata();
-      matches.push(firebaseItemFromFile(file, metadata));
-    }
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Content-Type", contentType);
+  res.setHeader("Cache-Control", "private, max-age=300");
+
+  if (range && size > 0) {
+    const match = range.match(/bytes=(\d+)-(\d*)/);
+    if (!match) return res.status(416).end();
+    const start = Number(match[1]);
+    const end = match[2] ? Number(match[2]) : size - 1;
+    if (start >= size || end >= size || start > end) return res.status(416).end();
+    res.status(206);
+    res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
+    res.setHeader("Content-Length", end - start + 1);
+    return file.createReadStream({ start, end }).pipe(res);
   }
 
-  return matches;
+  if (size > 0) res.setHeader("Content-Length", size);
+  return file.createReadStream().pipe(res);
 }
 
 function isExpiredUploadedAt(value, now = Date.now()) {
@@ -397,15 +354,6 @@ async function cleanupExpiredVideos() {
 async function findVideo(id) {
   const items = await readIndex();
   const item = items.find((entry) => entry.id === id);
-  const fallbackStoragePath = storagePathFromFirebaseVideoId(id);
-  if (!item && fallbackStoragePath) {
-    const bucket = await getFirebaseBucket();
-    const file = bucket.file(fallbackStoragePath);
-    const [exists] = await file.exists();
-    if (!exists) return null;
-    const [metadata] = await file.getMetadata();
-    return { item: firebaseItemFromFile(file, metadata), firebase: true };
-  }
   if (!item) return null;
   if (isFirebaseStorageItem(item)) return { item, firebase: true };
   const absolutePath = path.resolve(videoDir, item.storedName);
@@ -646,11 +594,7 @@ app.get("/api/videos", async (req, res, next) => {
     const filtered = query
       ? branchFiltered.filter((item) => compact(item.invoiceNumber).includes(query) || compact(item.fileName).includes(query))
       : branchFiltered;
-    const knownStoragePaths = new Set(items.filter(isFirebaseStorageItem).map((item) => item.storagePath));
-    const firebaseFallbackItems = storageFirst && query
-      ? await searchFirebaseVideosByInvoice(query, knownStoragePaths)
-      : [];
-    res.json({ items: sortVideosForStoragePriority([...filtered, ...firebaseFallbackItems], storageFirst).slice(0, 100) });
+    res.json({ items: sortVideosForStoragePriority(filtered, storageFirst).slice(0, 100) });
   } catch (error) {
     next(error);
   }
@@ -674,7 +618,7 @@ app.get("/api/videos/:id/stream", async (req, res, next) => {
     const found = await findVideo(req.params.id);
     if (!found) return res.status(404).json({ error: "video not found" });
     if (found.firebase) {
-      return res.redirect(await getFirebaseReadUrl(found.item, "inline"));
+      return streamFirebaseVideo(found.item, req, res);
     }
     const { item, absolutePath } = found;
 
