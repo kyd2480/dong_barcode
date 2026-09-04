@@ -29,7 +29,6 @@ const transcodeRetryAfterSeconds = Math.max(1, Number(process.env.CCTV_TRANSCODE
 let activeVideoUploads = 0;
 let activeVideoTranscodes = 0;
 let firebaseBucketPromise = null;
-let cleanupPromise = null;
 
 app.set("trust proxy", true);
 app.use(cors({ origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((item) => item.trim()) }));
@@ -315,54 +314,7 @@ function transcodeVideoToBrowserMp4(input, req, res, next) {
   });
 }
 
-async function cleanupExpiredFirebaseObjects(now = Date.now()) {
-  if (!hasFirebaseServiceAccountConfig() || !firebaseStorageBucket) {
-    return { scanned: 0, deleted: 0, failed: 0 };
-  }
-
-  const bucket = await getFirebaseBucket();
-  let pageToken;
-  let scanned = 0;
-  let deleted = 0;
-  let failed = 0;
-
-  do {
-    const [files, nextQuery] = await bucket.getFiles({
-      prefix: "videos/",
-      autoPaginate: false,
-      maxResults: 200,
-      ...(pageToken ? { pageToken } : {}),
-    });
-
-    scanned += files.length;
-    for (const file of files) {
-      // Some tools create zero-byte folder marker objects. They contain no video
-      // and can be ignored; normal Firebase folders are only virtual prefixes.
-      if (file.name.endsWith("/")) continue;
-
-      try {
-        let createdAt = new Date(file.metadata?.timeCreated || file.metadata?.updated || 0).getTime();
-        if (!Number.isFinite(createdAt) || createdAt <= 0) {
-          const [metadata] = await file.getMetadata();
-          createdAt = new Date(metadata.timeCreated || metadata.updated || 0).getTime();
-        }
-        if (!Number.isFinite(createdAt) || createdAt <= 0 || now - createdAt <= retentionMs) continue;
-
-        await file.delete({ ignoreNotFound: true });
-        deleted += 1;
-      } catch (error) {
-        failed += 1;
-        console.error(`Failed to delete expired Firebase object ${file.name}:`, error);
-      }
-    }
-
-    pageToken = nextQuery?.pageToken;
-  } while (pageToken);
-
-  return { scanned, deleted, failed };
-}
-
-async function runExpiredVideoCleanup() {
+async function cleanupExpiredVideos() {
   const now = Date.now();
   const items = await readIndex();
   const keep = [];
@@ -382,9 +334,6 @@ async function runExpiredVideoCleanup() {
         await bucket.file(item.storagePath).delete({ ignoreNotFound: true });
         deleted += 1;
       } catch (error) {
-        // Keep the index entry so a temporary permission/network failure can be
-        // retried during the next cleanup pass.
-        keep.push(item);
         console.error(`Failed to delete expired Firebase video ${item.storagePath}:`, error);
       }
       continue;
@@ -417,33 +366,10 @@ async function runExpiredVideoCleanup() {
   }
 
   if (keep.length !== items.length) await writeIndex(keep);
-
-  let firebaseSweep = { scanned: 0, deleted: 0, failed: 0 };
-  try {
-    // The index is only a search cache. Sweep Firebase itself so uploads that
-    // completed without an index entry are still covered by retention.
-    firebaseSweep = await cleanupExpiredFirebaseObjects(now);
-  } catch (error) {
-    firebaseSweep.failed += 1;
-    console.error("Failed to scan Firebase Storage for expired videos:", error);
+  if (deleted || looseDeleted) {
+    console.log(`Expired CCTV cleanup: indexDeleted=${deleted}, looseDeleted=${looseDeleted}, retentionDays=${retentionDays}`);
   }
-
-  console.log(
-    `Expired CCTV cleanup: indexDeleted=${deleted}, firebaseScanned=${firebaseSweep.scanned}, ` +
-      `firebaseOrphanDeleted=${firebaseSweep.deleted}, firebaseFailed=${firebaseSweep.failed}, ` +
-      `looseDeleted=${looseDeleted}, retentionDays=${retentionDays}`
-  );
-  return { deleted, looseDeleted, firebaseSweep, retentionDays };
-}
-
-async function cleanupExpiredVideos() {
-  // Upload and timer events can fire together. Share one cleanup run instead of
-  // scanning/deleting the same bucket concurrently.
-  if (cleanupPromise) return cleanupPromise;
-  cleanupPromise = runExpiredVideoCleanup().finally(() => {
-    cleanupPromise = null;
-  });
-  return cleanupPromise;
+  return { deleted, looseDeleted, retentionDays };
 }
 
 
